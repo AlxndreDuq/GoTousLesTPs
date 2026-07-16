@@ -1,0 +1,322 @@
+openapi: 3.0.3
+info:
+  title: Mira Notes API
+  description: >
+    TP#4 - API /api/v1/notes du projet fil rouge Mira, sur PostgreSQL, avec
+    enrichissement automatique asynchrone et recherche hybride
+    (full-text + vectorielle).
+  version: "4.0.0"
+servers:
+  - url: http://localhost:8080
+
+paths:
+  /api/v1/notes:
+    post:
+      summary: Créer une note
+      description: >
+        Écrit la note en base de façon synchrone (transaction note + tags
+        fournis), puis publie un job d'enrichissement dans le pipeline
+        interne. La réponse ne dépend pas de l'enrichissement : la note est
+        renvoyée avec `enrichment_status = "pending"`.
+      operationId: createNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateNoteRequest"
+      responses:
+        "201":
+          description: Note créée
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    get:
+      summary: Lister les notes
+      operationId: listNotes
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/StatusFilter"
+      responses:
+        "200":
+          description: Liste des notes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/notes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Récupérer une note
+      operationId: getNote
+      responses:
+        "200":
+          description: Note trouvée
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteEnvelope"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      summary: Mettre à jour partiellement une note
+      description: >
+        Seuls les champs fournis sont modifiés. Modifier `title` ou
+        `content` republie un job d'enrichissement (l'ancien résumé/tags/
+        embedding sont périmés) ; la note repasse alors en
+        `enrichment_status = "pending"`.
+      operationId: updateNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateNoteRequest"
+      responses:
+        "200":
+          description: Note mise à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Supprimer une note
+      operationId: deleteNote
+      responses:
+        "204":
+          description: Note supprimée
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/search:
+    get:
+      summary: Recherche hybride (full-text + similarité vectorielle)
+      description: >
+        Combine une recherche plein texte (`tsvector`/GIN, français) sur
+        titre et contenu avec une similarité cosinus sur les embeddings
+        produits par l'enrichissement (`pgvector`, index HNSW). Une note pas
+        encore enrichie peut malgré tout apparaître via son seul score
+        full-text.
+      operationId: searchNotes
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Terme recherché (insensible à la casse, sur title + content)
+      responses:
+        "200":
+          description: Notes correspondantes, triées par score hybride décroissant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoteListEnvelope"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /healthz:
+    get:
+      summary: Vérification de santé du service
+      operationId: healthz
+      responses:
+        "200":
+          description: Le service répond
+
+components:
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 20
+        maximum: 100
+      description: Nombre maximum de notes retournées (défaut 20, plafonné à 100).
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/NoteStatus"
+
+  responses:
+    BadRequest:
+      description: Payload ou paramètres invalides
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotFound:
+      description: Note inexistante
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+  schemas:
+    NoteStatus:
+      type: string
+      enum: [active, archived]
+
+    EnrichmentStatus:
+      type: string
+      enum: [pending, done, failed]
+      description: >
+        pending juste après la création/modification, done une fois le
+        worker d'enrichissement passé, failed si la tâche a échoué ou
+        dépassé son timeout.
+
+    Note:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        content:
+          type: string
+        status:
+          $ref: "#/components/schemas/NoteStatus"
+        tags:
+          type: array
+          items:
+            type: string
+          description: >
+            Union des tags fournis à la création/mise à jour et des tags
+            générés automatiquement par l'enrichissement.
+        enrichment_status:
+          $ref: "#/components/schemas/EnrichmentStatus"
+        summary:
+          type: string
+          description: Résumé court généré par l'enrichissement (vide tant que pending).
+        score:
+          type: number
+          nullable: true
+          description: Score de qualité/pertinence produit par l'enrichissement.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, title, content, status, tags, enrichment_status, created_at, updated_at]
+
+    CreateNoteRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+          maxLength: 10000
+        status:
+          $ref: "#/components/schemas/NoteStatus"
+        tags:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+      required: [title]
+
+    UpdateNoteRequest:
+      type: object
+      description: >
+        Seuls les champs fournis sont modifiés. `tags`, s'il est fourni,
+        remplace intégralement la liste existante (au lieu de la compléter,
+        contrairement à l'enrichissement automatique).
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+          maxLength: 10000
+        status:
+          $ref: "#/components/schemas/NoteStatus"
+        tags:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+
+    Meta:
+      type: object
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+      required: [total]
+
+    NoteEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/Note"
+      required: [data]
+
+    NoteListEnvelope:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Note"
+        meta:
+          $ref: "#/components/schemas/Meta"
+      required: [data, meta]
+
+    ErrorBody:
+      type: object
+      properties:
+        code:
+          type: string
+          enum: [invalid_json, validation_error, not_found, internal_error, timeout]
+        message:
+          type: string
+      required: [code, message]
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+      required: [error]
